@@ -1,4 +1,4 @@
-<!DOCTYPE html><!-- Extract v2.1 -->
+<!DOCTYPE html><!-- Extract-Dev v2.1 -->
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
@@ -29,8 +29,8 @@ const { useState, useRef, useCallback, useEffect } = React;
 pdfjsLib.GlobalWorkerOptions.workerSrc = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
 
 // ─── Constants ───────────────────────────────────────────────────────────────
-const PROXY = "https://thai-ledger-proxy-fwce.vercel.app";
-const APP_URL = "https://tashaponelis-taylorhsl.github.io/Extract/";
+const PROXY = "https://thai-ledger-proxy-dev.vercel.app";
+const APP_URL = "https://tashaponelis-taylorhsl.github.io/Extract-Dev/";
 const GRAPH_SCOPES = ["Files.Read.All","Sites.Read.All","offline_access","openid","profile"];
 const QBO_SCOPES = "com.intuit.quickbooks.accounting openid profile email phone address";
 const QBO_SANDBOX_BASE = "https://sandbox-quickbooks.api.intuit.com/v3/company";
@@ -272,6 +272,7 @@ function App() {
   const [kvHistory, setKvHistory] = useState({}); // clientId -> processed files from KV
   const [newProductThai, setNewProductThai] = useState("");
   const [historyData, setHistoryData] = useState(null); // null = not loaded yet
+  const [historyClientLoaded, setHistoryClientLoaded] = useState(null); // track which client was loaded
   const [newProductEnglish, setNewProductEnglish] = useState("");
   const [userLoading, setUserLoading] = useState(false);
   const fileInputRef = useRef();
@@ -3116,6 +3117,13 @@ function App() {
       </div>
 
         {/* ═══ HISTORY ═══ */}
+        {view===VIEWS.HISTORY && activeClient && historyClientLoaded!==activeClient && (()=>{
+          setHistoryClientLoaded(activeClient);
+          kvGet(`processed:${activeClient}`).then(data=>{
+            if(data) setHistoryData(data);
+          });
+          return null;
+        })()}
         {view===VIEWS.HISTORY && (
           <div style={{animation:"fadeUp 0.3s ease"}}>
             <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:24,flexWrap:"wrap",gap:12}}>
