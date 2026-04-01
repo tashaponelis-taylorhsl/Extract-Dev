@@ -78,6 +78,21 @@ Thai petty cash documents often have multiple pages:
 - Page 1 is typically a SUMMARY SHEET (ใบสรุปค่าใช้จ่าย) — handwritten or typed totals only. DO NOT extract line items from this page.
 - Page 2+ are the ACTUAL SUPPLIER INVOICES/RECEIPTS with full line item details
 
+MULTIPLE INVOICES IN ONE DOCUMENT:
+Sometimes a single petty cash payment covers TWO OR MORE separate supplier invoices from the SAME vendor.
+Detect this when you see:
+- Two separate invoice/receipt numbers on different pages
+- Two separate ใบกำกับภาษี headings or receipt headings  
+- Two separate subtotals/VAT amounts on different pages
+
+If multiple invoices detected:
+- Set "multipleInvoices": true
+- Set "invoices": array where each element has: documentNumber, taxInvoiceNumber, lines, subtotal, vatAmount, totalAmount
+- Root "totalAmount" = sum of all invoices (matches petty cash voucher total)
+- Root "voucherNumber" applies to all (same petty cash payment)
+- Root "vendor", "vendorVatNumber", "documentDate" apply to all (same vendor)
+If single invoice: set "multipleInvoices": false, use normal structure.
+
 YOU MUST prioritize data from supplier invoice/receipt pages (page 2+) over summary pages:
 - LINE ITEMS: extract ONLY from supplier invoice pages — NEVER from the summary page
 - TAX INVOICE heading (ใบกำกับภาษี): look on ALL pages, especially page 2+
@@ -1577,6 +1592,95 @@ function App() {
         previewVatType = vatPreview.vatType;
       } catch(e) { console.warn("VAT preview failed:", e); }
 
+      // Handle multiple invoices in one document
+      if (ex.multipleInvoices && ex.invoices && ex.invoices.length > 1) {
+        setPostStatus(s=>({...s,[ri]:{status:"posting", message:`Posting ${ex.invoices.length} bills...`}}));
+        const billIds = [];
+        const billAmounts = [];
+        
+        for (let invIdx = 0; invIdx < ex.invoices.length; invIdx++) {
+          const inv = ex.invoices[invIdx];
+          setPostStatus(s=>({...s,[ri]:{status:"posting", message:`Posting bill ${invIdx+1} of ${ex.invoices.length}...`}}));
+          
+          // Resolve GL accounts for this invoice's lines
+          const invLines = inv.lines || [];
+          const resolvedInvLines = [];
+          for (const l of invLines) {
+            const accountRef = await resolveGLAccount(l.accountName, l.description);
+            if (!accountRef) { setPostStatus(s=>({...s,[ri]:{status:"error", error:`GL account not found for: ${l.description}`}})); return; }
+            resolvedInvLines.push({...l, accountRef});
+          }
+
+          const { vatLines } = buildVATLines({...ex, vatAmount: inv.vatAmount, totalAmount: inv.totalAmount}, client, resolvedInvLines);
+          const billBody = {
+            VendorRef: vendorRef,
+            TxnDate: ex.documentDate,
+            DueDate: ex.documentDate,
+            DocNumber: (inv.documentNumber||"").slice(0,21),
+            CustomField: buildCustomFields(client, inv.taxInvoiceNumber||null),
+            PrivateNote: `Tax Invoice: ${inv.taxInvoiceNumber||inv.documentNumber} | Voucher: ${ex.voucherNumber} | Bill ${invIdx+1} of ${ex.invoices.length} | Source: ${result.file}`,
+            Line: [
+              ...resolvedInvLines.map(l => ({
+                Amount: Math.abs(l.amount),
+                DetailType: "AccountBasedExpenseLineDetail",
+                AccountBasedExpenseLineDetail: { AccountRef: l.accountRef },
+                Description: (l.description||"").slice(0,4000)
+              })),
+              ...vatLines
+            ].filter(l => l.Amount > 0)
+          };
+
+          const billRes = await qboPost(client, "/bill", billBody);
+          if (billRes.Fault) throw new Error(billRes.Fault.Error?.[0]?.Detail || `Bill ${invIdx+1} failed`);
+          const billId = billRes.Bill?.Id;
+          billIds.push(billId);
+          billAmounts.push(inv.totalAmount - (inv.vatAmount || 0)); // Ex-VAT amount for payment
+        }
+
+        // Create BillPayment linking all bills
+        setPostStatus(s=>({...s,[ri]:{status:"posting", message:"Creating petty cash payment..."}}));
+        const paymentBody = {
+          VendorRef: vendorRef,
+          PayType: "Check",
+          CheckPayment: {
+            BankAccountRef: { value: (client.chartOfAccounts||[]).find(a=>a.name===(client.pettyCashAccount||"Petty cash - office"))?.id, name: client.pettyCashAccount||"Petty cash - office" }
+          },
+          TotalAmt: ex.totalAmount,
+          TxnDate: ex.documentDate,
+          DocNumber: (ex.voucherNumber||"").slice(0,21),
+          PrivateNote: `Petty Cash payment | Voucher: ${ex.voucherNumber} | Bills: ${billIds.join(', ')} | Source: ${result.file}`,
+          Line: billIds.map((billId, i) => ({
+            Amount: billAmounts[i],
+            LinkedTxn: [{ TxnId: billId, TxnType: "Bill" }]
+          }))
+        };
+
+        const payRes = await qboPost(client, "/billpayment", paymentBody);
+        if (payRes.Fault) throw new Error("BillPayment failed: " + (payRes.Fault.Error?.[0]?.Detail || ""));
+        const paymentId = payRes.BillPayment?.Id;
+
+        // Attach PDF to first bill
+        if (result.fileData && billIds[0]) {
+          try {
+            await fetch(`${PROXY}/api/qbo-attach`, {
+              method:"POST", headers:{"Content-Type":"application/json"},
+              body: JSON.stringify({ token: client.qboToken, realmId: client.qboRealmId, fileData: result.fileData, fileName: result.file, entityType: "Bill", entityId: billIds[0], env: client.qboEnv||"sandbox" })
+            });
+          } catch(e) { console.warn("PDF attach failed:", e); }
+        }
+
+        const trackingId = result.fileId || `upload_${Date.now()}_${result.file}`;
+        markFileProcessed(client.id, trackingId, result.file, billIds[0], "Bill", {
+          vendor: ex.vendor, amount: ex.totalAmount, currency: ex.currency,
+          documentDate: ex.documentDate, voucherNumber: ex.voucherNumber,
+          taxInvoiceNumber: ex.invoices.map(i=>i.taxInvoiceNumber).filter(Boolean).join(', ')
+        });
+
+        setPostStatus(s=>({...s,[ri]:{status:"posted", qboId: billIds[0], txType:`${ex.invoices.length} Bills + Payment`}}));
+        setTimeout(() => setResults(prev => prev.filter((_,i) => i !== ri)), 8000);
+        return;
+      }
+
       // Use lines directly from results screen (already reviewed and edited by user)
       const finalRawLines = rawLines;
 
@@ -1753,6 +1857,42 @@ function App() {
   }
 
   // ── Microsoft Graph ──
+  async function createBillPayment(client, billIds, billAmounts, totalAmount, paymentDate, voucherNumber) {
+    // Create a BillPayment in QBO to pay multiple bills from petty cash
+    const pettyCashAcc = (client.chartOfAccounts||[]).find(a => 
+      a.name === (client.pettyCashAccount || "Petty cash - office")
+    );
+    if (!pettyCashAcc) throw new Error("Petty cash account not found — check client settings");
+
+    // Build payment lines for each bill
+    const paymentLines = billIds.map((billId, i) => ({
+      Amount: billAmounts[i],
+      LinkedTxn: [{ TxnId: billId, TxnType: "Bill" }]
+    }));
+
+    // Check for rounding variance
+    const billTotal = billAmounts.reduce((s, a) => s + a, 0);
+    const variance = Math.abs(totalAmount - billTotal);
+    
+    const billPaymentBody = {
+      VendorRef: null, // Will be set by caller
+      PayType: "Check",
+      CheckPayment: {
+        BankAccountRef: { value: pettyCashAcc.id, name: pettyCashAcc.name }
+      },
+      TotalAmt: totalAmount,
+      TxnDate: paymentDate,
+      DocNumber: voucherNumber,
+      PrivateNote: `Petty Cash payment | Voucher: ${voucherNumber} | Bills: ${billIds.join(', ')}${variance > 0 ? ` | Rounding variance: ฿${variance.toFixed(2)}` : ''}`,
+      Line: paymentLines
+    };
+
+    console.log("Creating BillPayment:", JSON.stringify(billPaymentBody));
+    const res = await qboPost(client, "/billpayment", billPaymentBody);
+    if (res.Fault) throw new Error(res.Fault.Error?.[0]?.Detail || "BillPayment failed");
+    return res.BillPayment?.Id;
+  }
+
   async function exchangeMsCode(code, verifier, msClientId, msTenantId) {
     // SPA tokens MUST be exchanged directly from browser (Microsoft requirement)
     // PKCE flow allows this without CORS issues
@@ -2963,6 +3103,7 @@ function App() {
                         <span style={{fontWeight:"bold",color:"#e2e8f0"}}>{ex?.vendor||result.file}</span>
                         {ex?.documentNumber&&<span style={{fontSize:11,color:"#475569"}}>#{ex.documentNumber}</span>}
                         {ex?.voucherNumber&&<span style={{fontSize:10,padding:"1px 7px",background:"rgba(59,130,246,0.1)",border:"1px solid rgba(59,130,246,0.2)",borderRadius:3,color:"#3b82f6"}}>🎫 {ex.voucherNumber}</span>}
+                        {ex?.multipleInvoices&&<span style={{fontSize:10,padding:"1px 7px",background:"rgba(245,158,11,0.1)",border:"1px solid rgba(245,158,11,0.2)",borderRadius:3,color:"#f59e0b"}}>📑 {ex.invoices?.length||2} invoices — will post {ex.invoices?.length||2} Bills + 1 Payment</span>}
                         {ex?.taxInvoiceNumber&&ex.taxInvoiceNumber!==ex.documentNumber&&<span style={{fontSize:10,padding:"1px 7px",background:"rgba(245,158,11,0.1)",border:"1px solid rgba(245,158,11,0.2)",borderRadius:3,color:"#f59e0b"}}>TAX INV: {ex.taxInvoiceNumber}</span>}
                         {ex?.taxInvoiceCompliance && ex && (() => {
                           const r = ex.taxInvoiceCompliance.complianceResult || "FAIL";
