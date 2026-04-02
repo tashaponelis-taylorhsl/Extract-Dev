@@ -354,19 +354,22 @@ function App() {
         setIsAuthenticated(true); // Auto-login from saved session
       }
     } catch(e) {}
-    // Load shared MS settings from KV if not in localStorage
+    // Always sync settings from KV on startup — survives localStorage loss
     try {
       const localSettings = JSON.parse(localStorage.getItem("extract_settings")||"{}");
-      if (!localSettings.msClientId) {
-        kvGet(`settings:${TRUSTED_DOMAIN}`).then(kvSettings => {
-          if (kvSettings?.msClientId) {
-            const merged = {...localSettings, ...kvSettings};
-            setSettings(merged);
-            localStorage.setItem("extract_settings", JSON.stringify(merged));
-            console.log("Loaded shared MS settings from cloud");
+      kvGet(`settings:${TRUSTED_DOMAIN}`).then(kvSettings => {
+        if (kvSettings && Object.keys(kvSettings).length > 0) {
+          // Merge: KV wins for MS credentials, localStorage wins for everything else
+          const merged = {...kvSettings, ...localSettings};
+          if (!localSettings.msClientId && kvSettings.msClientId) {
+            merged.msClientId = kvSettings.msClientId;
+            merged.msTenantId = kvSettings.msTenantId;
           }
-        }).catch(e => console.warn("KV settings load failed:", e));
-      }
+          setSettings(merged);
+          localStorage.setItem("extract_settings", JSON.stringify(merged));
+          console.log("Settings synced from cloud:", Object.keys(merged).filter(k=>merged[k]));
+        }
+      }).catch(e => console.warn("KV settings load failed:", e));
     } catch(e) {}
 
     // Handle OAuth callbacks
@@ -413,9 +416,14 @@ function App() {
   const saveSettings = async (s) => { 
     setSettings(s); 
     localStorage.setItem("extract_settings", JSON.stringify(s)); 
-    // Save MS settings to KV so all users get them automatically
-    await kvSet(`settings:${TRUSTED_DOMAIN}`, { msClientId: s.msClientId, msTenantId: s.msTenantId });
-    alert("✅ Settings saved successfully!"); 
+    // Save ALL settings to KV so they survive localStorage loss
+    try {
+      await kvSet(`settings:${TRUSTED_DOMAIN}`, s);
+      console.log("Settings saved to KV");
+    } catch(e) {
+      console.warn("KV settings save failed:", e.message);
+    }
+    alert("✅ Settings saved and backed up to cloud!"); 
   };
 
   // ── Error Logging ─────────────────────────────────────────────────────
