@@ -1213,7 +1213,7 @@ function App() {
           setDuplicateCheck(null);
 
           if (action === "dismiss") {
-            setTimeout(() => setResults(prev => prev.filter((_,i) => i !== ri)), 100);
+            // Keep error visible — user must dismiss manually
             return;
           }
 
@@ -1607,6 +1607,24 @@ function App() {
 
       // Handle multiple invoices in one document
       if (ex.multipleInvoices && ex.invoices && ex.invoices.length > 1) {
+        // PRE-FLIGHT CHECK: Verify voucher number not already used in QBO before creating any bills
+        setPostStatus(s=>({...s,[ri]:{status:"posting", message:"Checking for duplicates..."}}));
+        try {
+          const voucherCheck = await qboGet(client, `/query?query=select * from BillPayment where DocNumber = '${ex.voucherNumber}'&minorversion=75`);
+          const existingPayments = voucherCheck?.QueryResponse?.BillPayment || [];
+          const expenseCheck = await qboGet(client, `/query?query=select * from Purchase where DocNumber = '${ex.voucherNumber}'&minorversion=75`);
+          const existingExpenses = expenseCheck?.QueryResponse?.Purchase || [];
+          
+          if (existingPayments.length > 0 || existingExpenses.length > 0) {
+            const existing = existingPayments[0] || existingExpenses[0];
+            setPostStatus(s=>({...s,[ri]:{status:"error", error:`Duplicate voucher ${ex.voucherNumber} already exists in QBO as ${existing.Id ? "TxnId=" + existing.Id : "existing transaction"}. Please check QBO before posting.`}}));
+            return;
+          }
+        } catch(e) {
+          console.warn("Duplicate pre-check failed:", e.message);
+          // Continue posting if check fails — better than blocking incorrectly
+        }
+
         setPostStatus(s=>({...s,[ri]:{status:"posting", message:`Posting ${ex.invoices.length} bills...`}}));
         const billIds = [];
         const billAmounts = [];
@@ -1669,7 +1687,19 @@ function App() {
         };
 
         const payRes = await qboPost(client, "/billpayment", paymentBody);
-        if (payRes.Fault) throw new Error("BillPayment failed: " + (payRes.Fault.Error?.[0]?.Detail || ""));
+        if (payRes.Fault) {
+          // ROLLBACK: Void all bills we just created so QBO stays clean
+          setPostStatus(s=>({...s,[ri]:{status:"posting", message:"Payment failed — rolling back bills..."}}));
+          for (const billId of billIds) {
+            try {
+              const billData = await qboGet(client, `/bill/${billId}?minorversion=75`);
+              if (billData?.Bill) {
+                await qboPost(client, "/bill", {...billData.Bill, sparse: true, PrivateNote: (billData.Bill.PrivateNote||"") + " | VOIDED — BillPayment creation failed"});
+              }
+            } catch(e) { console.warn("Rollback failed for bill", billId, e.message); }
+          }
+          throw new Error("BillPayment failed: " + (payRes.Fault.Error?.[0]?.Detail || "") + " | Bills have been voided in QBO");
+        }
         const paymentId = payRes.BillPayment?.Id;
 
         // Attach PDF to first bill
