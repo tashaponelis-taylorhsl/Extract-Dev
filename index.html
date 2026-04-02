@@ -461,11 +461,23 @@ function App() {
   }
   const KV_USER = "taylorhsl"; // shared key for all users in this organisation
 
+  // Debounce timer for KV saves — prevents hammering KV on rapid changes
+  const kvSaveTimer = React.useRef(null);
+
   const saveClients = (c) => {
     const safeC = Array.isArray(c) ? c : [];
     setClients(safeC); 
     localStorage.setItem("extract_clients", JSON.stringify(safeC));
-    // KV sync done explicitly via ☁️ Sync button only
+    // Auto-save to KV with 3 second debounce — so rapid changes batch into one save
+    if (kvSaveTimer.current) clearTimeout(kvSaveTimer.current);
+    kvSaveTimer.current = setTimeout(() => {
+      try {
+        const lightweight = safeC.map(c => { const {chartOfAccounts,...r} = c; return r; });
+        kvSet(`clients:${KV_USER}`, lightweight)
+          .then(() => console.log("Auto-saved clients to KV"))
+          .catch(e => console.warn("Auto KV save failed:", e.message));
+      } catch(e) {}
+    }, 3000);
   };
 
   async function kvGet(key) {
