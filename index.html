@@ -278,6 +278,19 @@ function App() {
   const [postStatus, setPostStatus] = useState({}); // ri -> {status, qboId, error}
   const [currentUser, setCurrentUser] = useState(null);
   // Check if we have a saved session or OAuth callback in progress
+  // Fallback MS credentials — loaded if localStorage and KV are both empty
+  // This prevents lockout if settings are lost
+  const MS_CLIENT_ID_FALLBACK = "7536933f-ea05-42fc-af0a-cc80b04d433f";
+  const MS_TENANT_ID_FALLBACK = "d8c67863-dba1-4e00-b966-606bf3a5d38d";
+  try {
+    const s = JSON.parse(localStorage.getItem("extract_settings")||"{}");
+    if (!s.msClientId) {
+      s.msClientId = MS_CLIENT_ID_FALLBACK;
+      s.msTenantId = MS_TENANT_ID_FALLBACK;
+      localStorage.setItem("extract_settings", JSON.stringify(s));
+    }
+  } catch(e) {}
+
   const hasOAuthCallback = new URLSearchParams(window.location.search).has("code");
   const hasSavedUser = !!localStorage.getItem("extract_user");
   const [isAuthenticated, setIsAuthenticated] = useState(hasSavedUser || hasOAuthCallback);
@@ -2648,7 +2661,13 @@ function App() {
                           await kvSet(`customFields:${client.id}`, client.customFields||{});
                           console.log(`Saved ${client.chartOfAccounts.length} GL accounts to KV`);
                         }
-                        alert("✅ All data synced to cloud including GL accounts!");
+                        // Always save app settings to KV so they survive localStorage loss
+                        const localSettings = JSON.parse(localStorage.getItem("extract_settings")||"{}");
+                        if (localSettings.msClientId) {
+                          await kvSet(`settings:${TRUSTED_DOMAIN}`, localSettings);
+                          console.log("Settings saved to KV");
+                        }
+                        alert("✅ All data synced to cloud including GL accounts and settings!");
                       } catch(e) {
                         alert("❌ Sync failed: " + e.message);
                         console.error("Sync error:", e);
