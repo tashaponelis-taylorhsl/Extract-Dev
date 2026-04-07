@@ -113,7 +113,33 @@ ${client.businessDescription}
 3. If a line amount is unclear: use 0 as amount
 4. NEVER skip lines — if you see 5 lines extract 5 lines even if some are unclear
 5. NEVER guess or invent descriptions — only use what is clearly readable
-6. linesIncludeVAT: set true if line amounts appear to already include VAT (i.e. lines sum = document total including VAT), set false if lines are ex-VAT amounts
+6. LINE AMOUNTS — CRITICAL: Determine VAT inclusion MATHEMATICALLY only:
+   After reading all line amounts, sum them → lineSum
+   
+   Test A: lineSum ≈ (totalAmount - vatAmount) within ฿1 → lines are EX-VAT → linesIncludeVAT=false
+   Test B: lineSum ≈ totalAmount within ฿1 → lines are INC-VAT → linesIncludeVAT=true
+   
+   Do NOT rely on column labels to determine this — use the math only.
+   ALWAYS read vatAmount directly from the document VAT row — never calculate it.
+7. AMOUNT ACCURACY — CRITICAL SELF-CHECK:
+   After extracting all line amounts, perform this check BEFORE returning:
+   
+   Step 1: Sum all line amounts → lineSum
+   Step 2: Check if lines are ex-VAT: lineSum + vatAmount ≈ totalAmount (within ฿1)?
+           If YES → linesIncludeVAT = false, return as-is ✅
+   Step 3: Check if lines are inc-VAT: lineSum ≈ totalAmount (within ฿1)?
+           If YES → linesIncludeVAT = true, return as-is (app will divide by 1.07) ✅
+   Step 4: Neither matches → OCR error. Recalculate:
+           - Correct subtotal = totalAmount - vatAmount
+           - If only 1 line: set that line amount = correct subtotal
+           - If multiple lines: keep the ratio between lines but scale so they sum to correct subtotal
+           - Example: lines 3266.36 + 915.89 = 4182.25, correct subtotal = 4186.92
+             Scale factor = 4186.92/4182.25 = 1.001116
+             Line 1 = 3266.36 × 1.001116 = 3270.00 (rounded to nearest 0.01)
+             Line 2 = 915.89 × 1.001116 = 916.92
+             Check: 3270.00 + 916.92 = 4186.92 ✅
+   
+   Common OCR digit errors to watch for: 0↔6, 1↔7, 8↔3, 5↔6, 4↔9
 
 VAT CALCULATION CHECK:
 - If linesIncludeVAT is false: lines should sum to (totalAmount - vatAmount)
@@ -2068,32 +2094,37 @@ function App() {
   // ── Microsoft Graph ──
   function validateAndFixVAT(ex) {
     // Returns corrected extracted data with VAT issues flagged
+    // CORRECT LOGIC: lines (ex-VAT) + VAT = docTotal
     if (!ex || !ex.lines || ex.lines.length === 0) return { ex, warning: null };
     
     const lines = ex.lines || [];
     const docTotal = parseFloat(ex.totalAmount) || 0;
     const docVAT = parseFloat(ex.vatAmount) || 0;
-    const docSubtotal = docTotal - docVAT;
+    const docSubtotal = docTotal - docVAT; // Expected ex-VAT subtotal
     
     const lineSum = lines.reduce((s, l) => s + Math.abs(parseFloat(l.amount) || 0), 0);
-    const variance = Math.abs(lineSum - docSubtotal);
     
-    // If lines match subtotal — all good
-    if (variance <= 0.05) return { ex, warning: null };
+    // Case 1: Lines are ex-VAT and sum matches subtotal — perfect
+    const exVatVariance = Math.abs(lineSum - docSubtotal);
+    if (exVatVariance <= 1.0) {
+      console.log("VAT check OK: lines ex-VAT", lineSum.toFixed(2), "+ VAT", docVAT.toFixed(2), "=", docTotal.toFixed(2));
+      return { ex, warning: null };
+    }
     
-    // Check if lines are VAT-inclusive (lineSum ≈ docTotal)
-    const incVariance = Math.abs(lineSum - docTotal);
-    if (incVariance <= 0.05 || ex.linesIncludeVAT || ex.linesAreIncVat) {
-      // Auto-correct — divide lines by 1.07
-      console.log("Auto-correcting VAT-inclusive lines");
+    // Case 2: Lines are inc-VAT (lineSum ≈ docTotal)
+    const incVatVariance = Math.abs(lineSum - docTotal);
+    if (incVatVariance <= 5.0 || ex.linesIncludeVAT || ex.linesAreIncVat) {
+      // Auto-correct by dividing each line by 1.07
+      console.log("Auto-correcting VAT-inclusive lines:", lineSum.toFixed(2), "→ dividing by 1.07");
       const correctedLines = lines.map(l => ({
-        ...l, 
+        ...l,
         amount: Math.round((Math.abs(parseFloat(l.amount)||0) / 1.07) * 100) / 100
       }));
-      const correctedSum = correctedLines.reduce((s,l) => s + l.amount, 0);
+      const correctedSum = correctedLines.reduce((s, l) => s + l.amount, 0);
       const correctedVariance = Math.abs(correctedSum - docSubtotal);
-      if (correctedVariance <= 1.0) {
-        return { 
+      console.log("After correction:", correctedSum.toFixed(2), "vs subtotal", docSubtotal.toFixed(2), "variance:", correctedVariance.toFixed(2));
+      if (correctedVariance <= 5.0) {
+        return {
           ex: {...ex, lines: correctedLines, linesIncludeVAT: false},
           warning: null,
           autoFixed: true
@@ -2101,11 +2132,12 @@ function App() {
       }
     }
     
-    // Cannot auto-correct — return warning
+    // Case 3: Cannot reconcile — show warning with actual numbers
+    const grandTotal = lineSum + docVAT;
     return {
       ex,
-      warning: `Line items total ฿${lineSum.toFixed(2)} but document subtotal is ฿${docSubtotal.toFixed(2)} (variance: ฿${variance.toFixed(2)}). Please check line amounts before posting.`,
-      variance
+      warning: `Lines ฿${lineSum.toFixed(2)} + VAT ฿${docVAT.toFixed(2)} = ฿${grandTotal.toFixed(2)} but document total is ฿${docTotal.toFixed(2)} (difference: ฿${Math.abs(grandTotal-docTotal).toFixed(2)}). Please correct line amounts before posting.`,
+      variance: Math.abs(grandTotal - docTotal)
     };
   }
 
@@ -3476,14 +3508,17 @@ function App() {
                               )}
                               {ex.vatAmount > 0 && (()=>{
                                 const lineSum = (ex.lines||[]).reduce((s,l)=>s+Math.abs(l.amount||0),0);
-                                const docSubtotal = (ex.totalAmount||0)-(ex.vatAmount||0);
-                                const variance = Math.abs(lineSum-docSubtotal);
-                                const hasIssue = variance > 0.05;
+                                const docVAT = ex.vatAmount||0;
+                                const docTotal = ex.totalAmount||0;
+                                const grandTotal = lineSum + docVAT;
+                                const variance = Math.abs(grandTotal - docTotal);
+                                const hasIssue = variance > 1.0;
                                 return (
                                   <tr style={{background:hasIssue?"rgba(239,68,68,0.05)":"transparent"}}>
                                     <td colSpan={2} style={{padding:"6px 14px",color:hasIssue?"#ef4444":"#94a3b8",fontSize:11}}>
                                       VAT {ex.vatRate||7}%
-                                      {hasIssue && <span style={{marginLeft:8,fontSize:10,color:"#ef4444"}}>⚠️ Line total ฿{fmt(lineSum)} ≠ subtotal ฿{fmt(docSubtotal)}</span>}
+                                      {hasIssue && <span style={{marginLeft:8,fontSize:10,color:"#ef4444"}}>⚠️ Lines ฿{fmt(lineSum)} + VAT ฿{fmt(docVAT)} = ฿{fmt(grandTotal)} ≠ document ฿{fmt(docTotal)} (diff: ฿{fmt(variance)})</span>}
+                                      {!hasIssue && <span style={{marginLeft:8,fontSize:10,color:"#10b981"}}>✅ {fmt(lineSum)} + {fmt(docVAT)} = {fmt(grandTotal)}</span>}
                                     </td>
                                     <td style={{padding:"6px 14px",textAlign:"right",color:hasIssue?"#ef4444":"#94a3b8",fontFamily:"monospace",fontSize:11}}>{ex.currency||"THB"} {fmt(ex.vatAmount)}</td>
                                   </tr>
