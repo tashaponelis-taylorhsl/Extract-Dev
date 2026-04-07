@@ -2489,16 +2489,24 @@ function App() {
       }catch(err){newResults.push({file:file.name,extracted:null,error:err.message});}
     }
     const sel={};
-    newResults.forEach((r,ri)=>{
+    // Auto-fix VAT-inclusive lines before displaying results
+    const vatFixedResults = newResults.map(r => {
+      if (!r.extracted) return r;
+      const { ex: fixedEx, autoFixed } = validateAndFixVAT(r.extracted);
+      if (autoFixed) console.log("Auto-fixed VAT for:", r.file);
+      return {...r, extracted: fixedEx};
+    });
+
+    vatFixedResults.forEach((r,ri)=>{
       if(r.extracted){sel[`${ri}-main`]=true;}
       if(r.extracted?.whtAmount>0)sel[`${ri}-wht`]=true;
     });
     setSelectedRows(sel);
-    setResults(newResults);
+    setResults(vatFixedResults);
     setStage(STAGES.DONE);
     // Auto-show compliance for first non-compliant tax invoice
     try {
-      const firstNonCompliant = newResults.find(r =>
+      const firstNonCompliant = vatFixedResults.find(r =>
         r.extracted?.taxInvoiceCompliance &&
         r.extracted.taxInvoiceCompliance.complianceResult !== "PASS"
       );
@@ -2547,12 +2555,20 @@ function App() {
       }catch(err){newResults.push({file:file.name,extracted:null,error:err.message});}
     }
     const sel={};
-    newResults.forEach((r,ri)=>{
+    // Auto-fix VAT-inclusive lines before displaying
+    const vatFixedResults2 = newResults.map(r => {
+      if (!r.extracted) return r;
+      const { ex: fixedEx, autoFixed } = validateAndFixVAT(r.extracted);
+      if (autoFixed) console.log("Auto-fixed VAT for:", r.file);
+      return {...r, extracted: fixedEx};
+    });
+
+    vatFixedResults2.forEach((r,ri)=>{
       if(r.extracted)sel[`${ri}-main`]=true;
       if(r.extracted?.whtAmount>0)sel[`${ri}-wht`]=true;
     });
     setSelectedRows(sel);
-    setResults(newResults);
+    setResults(vatFixedResults2);
     setStage(STAGES.DONE);
   }
 
