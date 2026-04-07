@@ -2098,25 +2098,33 @@ function App() {
       return { ex, warning: null };
     }
     
-    // Case 2: Lines are inc-VAT (lineSum ≈ docTotal)
+    // Case 2: Lines are inc-VAT (lineSum ≈ docTotal within 5%)
     const incVatVariance = Math.abs(lineSum - docTotal);
-    if (incVatVariance <= 5.0 || ex.linesIncludeVAT || ex.linesAreIncVat) {
-      // Auto-correct by dividing each line by 1.07
-      console.log("Auto-correcting VAT-inclusive lines:", lineSum.toFixed(2), "→ dividing by 1.07");
+    const incVatPct = docTotal > 0 ? incVatVariance / docTotal : 1;
+    if (incVatPct <= 0.05 || ex.linesIncludeVAT || ex.linesAreIncVat) {
+      // Scale lines proportionally to correct ex-VAT subtotal
+      // This works whether AI returned inc-VAT, approximate, or slightly wrong values
+      console.log("Auto-correcting lines to ex-VAT. lineSum:", lineSum.toFixed(2), "docTotal:", docTotal.toFixed(2), "docSubtotal:", docSubtotal.toFixed(2));
       const correctedLines = lines.map(l => ({
         ...l,
-        amount: Math.round((Math.abs(parseFloat(l.amount)||0) / 1.07) * 100) / 100
+        // Scale: preserve ratio between lines, but sum to docSubtotal exactly
+        amount: lineSum > 0 
+          ? Math.round((Math.abs(parseFloat(l.amount)||0) / lineSum * docSubtotal) * 100) / 100
+          : 0
       }));
+      // Fix rounding on last line so total is exact
       const correctedSum = correctedLines.reduce((s, l) => s + l.amount, 0);
-      const correctedVariance = Math.abs(correctedSum - docSubtotal);
-      console.log("After correction:", correctedSum.toFixed(2), "vs subtotal", docSubtotal.toFixed(2), "variance:", correctedVariance.toFixed(2));
-      if (correctedVariance <= 5.0) {
-        return {
-          ex: {...ex, lines: correctedLines, linesIncludeVAT: false},
-          warning: null,
-          autoFixed: true
-        };
+      const rounding = Math.round((docSubtotal - correctedSum) * 100) / 100;
+      if (correctedLines.length > 0 && Math.abs(rounding) <= 0.10) {
+        correctedLines[correctedLines.length-1].amount = 
+          Math.round((correctedLines[correctedLines.length-1].amount + rounding) * 100) / 100;
       }
+      console.log("Corrected lines:", correctedLines.map(l=>l.amount));
+      return {
+        ex: {...ex, lines: correctedLines, linesIncludeVAT: false},
+        warning: null,
+        autoFixed: true
+      };
     }
     
     // Case 3: Cannot reconcile — show warning with actual numbers
