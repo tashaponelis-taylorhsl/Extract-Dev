@@ -2091,6 +2091,18 @@ function App() {
     
     const lineSum = lines.reduce((s, l) => s + Math.abs(parseFloat(l.amount) || 0), 0);
     
+    console.log("VAT CHECK:", {
+      lineAmounts: lines.map(l=>l.amount),
+      lineSum: lineSum.toFixed(2),
+      docTotal: docTotal.toFixed(2),
+      docVAT: docVAT.toFixed(2),
+      docSubtotal: docSubtotal.toFixed(2),
+      linesIncludeVAT: ex.linesIncludeVAT,
+      exVatVariance: Math.abs(lineSum-docSubtotal).toFixed(2),
+      incVatVariance: Math.abs(lineSum-docTotal).toFixed(2),
+      incVatPct: docTotal>0?(Math.abs(lineSum-docTotal)/docTotal*100).toFixed(1)+"%":"N/A"
+    });
+    
     // Case 1: Lines are ex-VAT and sum matches subtotal — perfect
     const exVatVariance = Math.abs(lineSum - docSubtotal);
     if (exVatVariance <= 1.0) {
