@@ -107,7 +107,27 @@ YOU MUST prioritize data from supplier invoice/receipt pages (page 2+) over summ
 ${client.businessDescription ? `BUSINESS CONTEXT (use this to correctly categorise expenses):
 ${client.businessDescription}
 
-` : ""}CHART OF ACCOUNTS (use EXACT names from this list for account classification):
+` : ""}LINE ITEM EXTRACTION RULES:
+1. Extract EVERY line item you can see — count the lines on the document and extract the same number
+2. If a line description is unclear or unreadable: use "UNREADABLE - please correct" as description
+3. If a line amount is unclear: use 0 as amount
+4. NEVER skip lines — if you see 5 lines extract 5 lines even if some are unclear
+5. NEVER guess or invent descriptions — only use what is clearly readable
+6. linesIncludeVAT: set true if line amounts appear to already include VAT (i.e. lines sum = document total including VAT), set false if lines are ex-VAT amounts
+
+VAT CALCULATION CHECK:
+- If linesIncludeVAT is false: lines should sum to (totalAmount - vatAmount)
+- If linesIncludeVAT is true: divide each line amount by 1.07 to get ex-VAT amount
+- Always read vatAmount directly from the VAT table on the document — never calculate it from lines
+
+CREDIT NOTE DETECTION:
+- If any page contains ใบลดหนี้, Credit Note, or shows negative amounts against a vendor:
+  - Set "creditNote": true
+  - Set "creditAmount": the credit amount (positive number)
+  - Set "creditDocNumber": the credit note document number
+  - The credit will be automatically applied against the bill
+
+CHART OF ACCOUNTS (use EXACT names from this list for account classification):
 ${chartOfAccounts.map(a => `- ${a.name} (${a.type})`).join('\n')}
 
 WORKFLOW RULES:
@@ -129,6 +149,7 @@ Return ONLY this JSON (no markdown):
     {"description":"English description of item 1","amount":100.00,"accountName":"exact account name from chart"},
     {"description":"English description of item 2","amount":50.00,"accountName":"exact account name from chart"}
   ],
+  "linesIncludeVAT": false,
   "subtotal": 0,
   "discount": 0,
   "vatRate": 7,
@@ -141,6 +162,11 @@ Return ONLY this JSON (no markdown):
   "isDuplicate": false,
   "notes": "",
   "linesAreIncVat": false,
+  "multipleInvoices": false,
+  "invoices": [],
+  "creditNote": false,
+  "creditAmount": 0,
+  "creditDocNumber": "",
   "taxInvoiceCompliance": {
     "hasThaiTaxInvoiceHeading": true,
     "vendorName": true,
@@ -1794,7 +1820,7 @@ function App() {
       const finalRawLines = rawLines;
 
       // Resolve GL accounts with learning
-      const resolvedLines = [];
+      let resolvedLines = [];
       for (const l of finalRawLines) {
         const accountRef = await resolveGLAccount(l.accountName, l.description);
         if (!accountRef) {
@@ -1816,6 +1842,20 @@ function App() {
           setPostStatus(s=>({...s,[ri]:{status:"error", error:"Skipped — no voucher number found. Please add manually."}}));
           return;
         }
+      }
+
+      // Validate and auto-fix VAT calculation
+      const { ex: fixedEx, warning: vatWarning, autoFixed } = validateAndFixVAT({...ex, lines: resolvedLines.map(l => ({...l}))});
+      if (autoFixed) {
+        console.log("VAT auto-corrected — lines were VAT-inclusive");
+      }
+      if (vatWarning) {
+        setPostStatus(s=>({...s,[ri]:{status:"error", error:"⚠️ VAT mismatch: " + vatWarning}}));
+        return;
+      }
+      // Use corrected lines if auto-fixed
+      if (autoFixed) {
+        resolvedLines = fixedEx.lines.map((l, i) => ({...resolvedLines[i], amount: l.amount}));
       }
 
       // Build VAT lines
@@ -1899,6 +1939,66 @@ function App() {
         txType = "Expense";
       }
 
+      // ── Handle Credit Note if present ──
+      if (ex.creditNote && ex.creditAmount > 0 && txId && ex.transactionType === "Bill") {
+        try {
+          setPostStatus(s=>({...s,[ri]:{status:"posting", message:"Creating vendor credit..."}}));
+          
+          // Find the GL account from the bill lines
+          const creditAccountRef = resolvedLines[0]?.accountRef || {value:"1", name:"Accounts Payable"};
+          
+          const creditBody = {
+            VendorRef: vendorRef,
+            TxnDate: toQBODate(ex.documentDate),
+            DocNumber: (ex.creditDocNumber||"CN-"+refNo).slice(0,21),
+            PrivateNote: `Credit Note against Bill #${txId} | Voucher: ${ex.voucherNumber} | Source: ${result.file}`,
+            Line: [{
+              Amount: ex.creditAmount,
+              DetailType: "AccountBasedExpenseLineDetail",
+              AccountBasedExpenseLineDetail: { AccountRef: creditAccountRef },
+              Description: "Credit Note"
+            }]
+          };
+          
+          const creditRes = await qboPost(client, "/vendorcredit", creditBody);
+          if (creditRes.Fault) {
+            console.warn("Vendor credit failed:", creditRes.Fault.Error?.[0]?.Detail);
+          } else {
+            const creditId = creditRes.VendorCredit?.Id;
+            console.log("Vendor credit created:", creditId);
+            
+            // Apply credit to bill via BillPayment
+            const netPayment = ex.totalAmount - ex.creditAmount;
+            if (netPayment > 0 && vendorRef) {
+              const pettyCashAcc = accounts.find(a => 
+                a.name.toLowerCase() === (client.pettyCashAccount||"petty cash - office").toLowerCase()
+              );
+              if (pettyCashAcc) {
+                const payBody = {
+                  VendorRef: vendorRef,
+                  PayType: "Check",
+                  CheckPayment: { BankAccountRef: { value: pettyCashAcc.id, name: pettyCashAcc.name }},
+                  TotalAmt: netPayment,
+                  TxnDate: toQBODate(ex.documentDate),
+                  DocNumber: (ex.voucherNumber||refNo||"").slice(0,21),
+                  PrivateNote: `Payment | Bill #${txId} | Credit Note #${creditId} | Net: ฿${netPayment} | Source: ${result.file}`,
+                  Line: [
+                    { Amount: ex.totalAmount, LinkedTxn: [{ TxnId: txId, TxnType: "Bill" }] },
+                    { Amount: ex.creditAmount, LinkedTxn: [{ TxnId: creditId, TxnType: "VendorCredit" }] }
+                  ]
+                };
+                const payRes = await qboPost(client, "/billpayment", payBody);
+                if (payRes.Fault) console.warn("BillPayment with credit failed:", payRes.Fault.Error?.[0]?.Detail);
+                else console.log("BillPayment with credit applied:", payRes.BillPayment?.Id);
+              }
+            }
+          }
+        } catch(e) {
+          console.warn("Credit note processing failed:", e.message);
+          // Don't fail the whole posting — bill was already created successfully
+        }
+      }
+
       // ── Learn from this posting ──
       resolvedLines.forEach(l => {
         learnGLRule(client.id, ex.vendor, ex.transactionType, l.description, l.accountRef.name);
@@ -1966,6 +2066,49 @@ function App() {
   }
 
   // ── Microsoft Graph ──
+  function validateAndFixVAT(ex) {
+    // Returns corrected extracted data with VAT issues flagged
+    if (!ex || !ex.lines || ex.lines.length === 0) return { ex, warning: null };
+    
+    const lines = ex.lines || [];
+    const docTotal = parseFloat(ex.totalAmount) || 0;
+    const docVAT = parseFloat(ex.vatAmount) || 0;
+    const docSubtotal = docTotal - docVAT;
+    
+    const lineSum = lines.reduce((s, l) => s + Math.abs(parseFloat(l.amount) || 0), 0);
+    const variance = Math.abs(lineSum - docSubtotal);
+    
+    // If lines match subtotal — all good
+    if (variance <= 0.05) return { ex, warning: null };
+    
+    // Check if lines are VAT-inclusive (lineSum ≈ docTotal)
+    const incVariance = Math.abs(lineSum - docTotal);
+    if (incVariance <= 0.05 || ex.linesIncludeVAT || ex.linesAreIncVat) {
+      // Auto-correct — divide lines by 1.07
+      console.log("Auto-correcting VAT-inclusive lines");
+      const correctedLines = lines.map(l => ({
+        ...l, 
+        amount: Math.round((Math.abs(parseFloat(l.amount)||0) / 1.07) * 100) / 100
+      }));
+      const correctedSum = correctedLines.reduce((s,l) => s + l.amount, 0);
+      const correctedVariance = Math.abs(correctedSum - docSubtotal);
+      if (correctedVariance <= 1.0) {
+        return { 
+          ex: {...ex, lines: correctedLines, linesIncludeVAT: false},
+          warning: null,
+          autoFixed: true
+        };
+      }
+    }
+    
+    // Cannot auto-correct — return warning
+    return {
+      ex,
+      warning: `Line items total ฿${lineSum.toFixed(2)} but document subtotal is ฿${docSubtotal.toFixed(2)} (variance: ฿${variance.toFixed(2)}). Please check line amounts before posting.`,
+      variance
+    };
+  }
+
   async function createBillPayment(client, billIds, billAmounts, totalAmount, paymentDate, voucherNumber) {
     // Create a BillPayment in QBO to pay multiple bills from petty cash
     const pettyCashAcc = (client.chartOfAccounts||[]).find(a => 
@@ -3219,6 +3362,7 @@ function App() {
                         {ex?.documentNumber&&<span style={{fontSize:11,color:"#475569"}}>#{ex.documentNumber}</span>}
                         {ex?.voucherNumber&&<span style={{fontSize:10,padding:"1px 7px",background:"rgba(59,130,246,0.1)",border:"1px solid rgba(59,130,246,0.2)",borderRadius:3,color:"#3b82f6"}}>🎫 {ex.voucherNumber}</span>}
                         {ex?.multipleInvoices&&<span style={{fontSize:10,padding:"1px 7px",background:"rgba(245,158,11,0.1)",border:"1px solid rgba(245,158,11,0.2)",borderRadius:3,color:"#f59e0b"}}>📑 {ex.invoices?.length||2} invoices — will post {ex.invoices?.length||2} Bills + 1 Payment</span>}
+                        {ex?.creditNote&&<span style={{fontSize:10,padding:"1px 7px",background:"rgba(16,185,129,0.1)",border:"1px solid rgba(16,185,129,0.2)",borderRadius:3,color:"#10b981"}}>🔄 Credit Note ฿{fmt(ex.creditAmount||0)} — will deduct from payment</span>}
                         {ex?.taxInvoiceNumber&&ex.taxInvoiceNumber!==ex.documentNumber&&<span style={{fontSize:10,padding:"1px 7px",background:"rgba(245,158,11,0.1)",border:"1px solid rgba(245,158,11,0.2)",borderRadius:3,color:"#f59e0b"}}>TAX INV: {ex.taxInvoiceNumber}</span>}
                         {ex?.taxInvoiceCompliance && ex && (() => {
                           const r = ex.taxInvoiceCompliance.complianceResult || "FAIL";
@@ -3324,6 +3468,33 @@ function App() {
                               {ex.discount>0&&<tr><td colSpan={2} style={{padding:"5px 14px",fontSize:11,color:"#475569"}}>Discount</td><td style={{padding:"5px 14px",textAlign:"right",fontSize:11,color:"#64748b",fontFamily:"monospace"}}>-{fmt(ex.discount)}</td></tr>}
                               {ex.vatAmount>0&&<tr><td colSpan={2} style={{padding:"5px 14px",fontSize:11,color:"#475569"}}>VAT {ex.vatRate||7}%</td><td style={{padding:"5px 14px",textAlign:"right",fontSize:11,color:"#64748b",fontFamily:"monospace"}}>{fmt(ex.vatAmount)}</td></tr>}
                               {ex.whtAmount>0&&<tr><td colSpan={2} style={{padding:"5px 14px",fontSize:11,color:"#475569"}}>WHT {ex.whtRate||3}% (deducted at source)</td><td style={{padding:"5px 14px",textAlign:"right",fontSize:11,color:"#4ade80",fontFamily:"monospace"}}>-{fmt(ex.whtAmount)}</td></tr>}
+                              {ex.vatAmount > 0 && (
+                                <tr>
+                                  <td colSpan={2} style={{padding:"6px 14px",color:"#94a3b8",fontSize:11}}>Subtotal (ex-VAT)</td>
+                                  <td style={{padding:"6px 14px",textAlign:"right",color:"#94a3b8",fontFamily:"monospace",fontSize:11}}>{ex.currency||"THB"} {fmt((ex.totalAmount||0)-(ex.vatAmount||0))}</td>
+                                </tr>
+                              )}
+                              {ex.vatAmount > 0 && (()=>{
+                                const lineSum = (ex.lines||[]).reduce((s,l)=>s+Math.abs(l.amount||0),0);
+                                const docSubtotal = (ex.totalAmount||0)-(ex.vatAmount||0);
+                                const variance = Math.abs(lineSum-docSubtotal);
+                                const hasIssue = variance > 0.05;
+                                return (
+                                  <tr style={{background:hasIssue?"rgba(239,68,68,0.05)":"transparent"}}>
+                                    <td colSpan={2} style={{padding:"6px 14px",color:hasIssue?"#ef4444":"#94a3b8",fontSize:11}}>
+                                      VAT {ex.vatRate||7}%
+                                      {hasIssue && <span style={{marginLeft:8,fontSize:10,color:"#ef4444"}}>⚠️ Line total ฿{fmt(lineSum)} ≠ subtotal ฿{fmt(docSubtotal)}</span>}
+                                    </td>
+                                    <td style={{padding:"6px 14px",textAlign:"right",color:hasIssue?"#ef4444":"#94a3b8",fontFamily:"monospace",fontSize:11}}>{ex.currency||"THB"} {fmt(ex.vatAmount)}</td>
+                                  </tr>
+                                );
+                              })()}
+                              {ex.creditNote && ex.creditAmount > 0 && (
+                                <tr style={{background:"rgba(16,185,129,0.05)"}}>
+                                  <td colSpan={2} style={{padding:"6px 14px",color:"#10b981",fontSize:11}}>Credit Note ({ex.creditDocNumber||"CN"})</td>
+                                  <td style={{padding:"6px 14px",textAlign:"right",color:"#10b981",fontFamily:"monospace",fontSize:11}}>- {ex.currency||"THB"} {fmt(ex.creditAmount)}</td>
+                                </tr>
+                              )}
                               <tr>
                                 <td colSpan={2} style={{padding:"8px 14px",fontWeight:"bold",color:"#94a3b8",fontSize:12}}>{ex.transactionType==="Bill"?"Total Bill Amount":"Total Expense"}</td>
                                 <td style={{padding:"8px 14px",textAlign:"right",fontWeight:"bold",color:"#e2e8f0",fontFamily:"monospace",fontSize:13}}>{ex.currency||"THB"} {fmt(ex.totalAmount)}</td>
