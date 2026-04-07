@@ -113,33 +113,20 @@ ${client.businessDescription}
 3. If a line amount is unclear: use 0 as amount
 4. NEVER skip lines — if you see 5 lines extract 5 lines even if some are unclear
 5. NEVER guess or invent descriptions — only use what is clearly readable
-6. LINE AMOUNTS — CRITICAL: Determine VAT inclusion MATHEMATICALLY only:
-   After reading all line amounts, sum them → lineSum
+6. LINE AMOUNTS — CRITICAL:
+   ALWAYS read line amounts EXACTLY as printed on the document — do NOT calculate or convert them.
+   NEVER divide by 1.07 or perform any math on line amounts — read the exact printed number only.
    
-   Test A: lineSum ≈ (totalAmount - vatAmount) within ฿1 → lines are EX-VAT → linesIncludeVAT=false
-   Test B: lineSum ≈ totalAmount within ฿1 → lines are INC-VAT → linesIncludeVAT=true
+   After reading the exact printed amounts, sum them → lineSum, then determine:
+   Test A: lineSum ≈ (totalAmount - vatAmount) within ฿1 → linesIncludeVAT=false
+   Test B: lineSum ≈ totalAmount within ฿1 → linesIncludeVAT=true
    
-   Do NOT rely on column labels to determine this — use the math only.
+   The app will handle any conversion — your job is only to read exact numbers from the document.
    ALWAYS read vatAmount directly from the document VAT row — never calculate it.
-7. AMOUNT ACCURACY — CRITICAL SELF-CHECK:
-   After extracting all line amounts, perform this check BEFORE returning:
-   
-   Step 1: Sum all line amounts → lineSum
-   Step 2: Check if lines are ex-VAT: lineSum + vatAmount ≈ totalAmount (within ฿1)?
-           If YES → linesIncludeVAT = false, return as-is ✅
-   Step 3: Check if lines are inc-VAT: lineSum ≈ totalAmount (within ฿1)?
-           If YES → linesIncludeVAT = true, return as-is (app will divide by 1.07) ✅
-   Step 4: Neither matches → OCR error. Recalculate:
-           - Correct subtotal = totalAmount - vatAmount
-           - If only 1 line: set that line amount = correct subtotal
-           - If multiple lines: keep the ratio between lines but scale so they sum to correct subtotal
-           - Example: lines 3266.36 + 915.89 = 4182.25, correct subtotal = 4186.92
-             Scale factor = 4186.92/4182.25 = 1.001116
-             Line 1 = 3266.36 × 1.001116 = 3270.00 (rounded to nearest 0.01)
-             Line 2 = 915.89 × 1.001116 = 916.92
-             Check: 3270.00 + 916.92 = 4186.92 ✅
-   
-   Common OCR digit errors to watch for: 0↔6, 1↔7, 8↔3, 5↔6, 4↔9
+7. AMOUNT ACCURACY:
+   Read each amount digit by digit exactly as printed. Common OCR errors to watch for: 0↔6, 1↔7, 8↔3.
+   Set linesIncludeVAT correctly using the math tests in rule 6 above.
+   Do NOT recalculate or adjust any amounts — read exactly what is printed.
 
 VAT CALCULATION CHECK:
 - If linesIncludeVAT is false: lines should sum to (totalAmount - vatAmount)
