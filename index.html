@@ -1,4 +1,4 @@
-<!DOCTYPE html><!-- Extract-Dev v2.1 -->
+<!DOCTYPE html><!-- Extract Production v2.1 -->
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
@@ -29,9 +29,9 @@ const { useState, useRef, useCallback, useEffect } = React;
 pdfjsLib.GlobalWorkerOptions.workerSrc = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
 
 // ─── Constants ───────────────────────────────────────────────────────────────
-const PROXY = "https://thai-ledger-proxy-dev.vercel.app";
-const ENV = "development"; // DO NOT CHANGE — use "development" in Dev file only
-const APP_URL = "https://tashaponelis-taylorhsl.github.io/Extract-Dev/";
+const PROXY = "https://thai-ledger-proxy-fwce.vercel.app";
+const ENV = "production"; // DO NOT CHANGE — use "development" in Dev file only
+const APP_URL = "https://tashaponelis-taylorhsl.github.io/Extract/";
 const GRAPH_SCOPES = ["Files.Read.All","Sites.Read.All","offline_access","openid","profile"];
 const QBO_SCOPES = "com.intuit.quickbooks.accounting openid profile email phone address";
 const QBO_SANDBOX_BASE = "https://sandbox-quickbooks.api.intuit.com/v3/company";
@@ -1597,6 +1597,12 @@ function App() {
     setPostStatus(s=>({...s,[ri]:{status:"posting"}}));
     try {
       const ex = result.extracted;
+      console.log("PostToQBO client:", {
+        name: client.name,
+        taxInvoiceFieldId: client.taxInvoiceFieldId,
+        customFieldsCount: Object.keys(client.customFields||{}).length,
+        qboConnected: client.qboConnected
+      });
 
       // Guard against null extracted data
       if (!ex) {
@@ -1701,7 +1707,10 @@ function App() {
         // vendorRef = null means no vendor on the expense — perfectly valid for petty cash
       }
 
-      const rawLines = (ex.lines||[{description: ex.transactions?.[0]?.description||"Service", amount: ex.totalAmount||0, accountName: ex.transactions?.[0]?.category||""}]);
+      // Apply VAT correction to rawLines BEFORE GL resolution
+      const { ex: vatCorrectedEx, autoFixed: vatAutoFixed } = validateAndFixVAT(ex);
+      if (vatAutoFixed) console.log("VAT auto-corrected during posting for:", result.file);
+      const rawLines = (vatCorrectedEx.lines||[{description: ex.transactions?.[0]?.description||"Service", amount: ex.totalAmount||0, accountName: ex.transactions?.[0]?.category||""}]);
 
       // Show line review modal before posting — let user verify groupings
       let previewVatType = "none";
@@ -1857,18 +1866,16 @@ function App() {
         }
       }
 
-      // Validate and auto-fix VAT calculation
-      const { ex: fixedEx, warning: vatWarning, autoFixed } = validateAndFixVAT({...ex, lines: resolvedLines.map(l => ({...l}))});
-      if (autoFixed) {
-        console.log("VAT auto-corrected — lines were VAT-inclusive");
-      }
-      if (vatWarning) {
-        setPostStatus(s=>({...s,[ri]:{status:"error", error:"⚠️ VAT mismatch: " + vatWarning}}));
-        return;
-      }
-      // Use corrected lines if auto-fixed
-      if (autoFixed) {
-        resolvedLines = fixedEx.lines.map((l, i) => ({...resolvedLines[i], amount: l.amount}));
+      // Validate final amounts match document total
+      const lineTotal = resolvedLines.reduce((s,l) => s+Math.abs(l.amount||0), 0);
+      const expectedTotal = (ex.totalAmount||0) - (ex.vatAmount||0);
+      const finalVariance = Math.abs(lineTotal - expectedTotal);
+      if (finalVariance > 1.0) {
+        const { warning: vatWarning } = validateAndFixVAT({...vatCorrectedEx, lines: resolvedLines});
+        if (vatWarning) {
+          setPostStatus(s=>({...s,[ri]:{status:"error", error:"⚠️ VAT mismatch: " + vatWarning}}));
+          return;
+        }
       }
 
       // Build VAT lines
@@ -2110,10 +2117,11 @@ function App() {
       return { ex, warning: null };
     }
     
-    // Case 2: Lines are inc-VAT (lineSum ≈ docTotal within 5%)
+    // Case 2: Lines are inc-VAT
+    // Trigger if: AI flagged linesIncludeVAT=true, OR lineSum is within 10% of docTotal
     const incVatVariance = Math.abs(lineSum - docTotal);
     const incVatPct = docTotal > 0 ? incVatVariance / docTotal : 1;
-    if (incVatPct <= 0.05 || ex.linesIncludeVAT || ex.linesAreIncVat) {
+    if (ex.linesIncludeVAT || ex.linesAreIncVat || incVatPct <= 0.10) {
       // Scale lines proportionally to correct ex-VAT subtotal
       // This works whether AI returned inc-VAT, approximate, or slightly wrong values
       console.log("Auto-correcting lines to ex-VAT. lineSum:", lineSum.toFixed(2), "docTotal:", docTotal.toFixed(2), "docSubtotal:", docSubtotal.toFixed(2));
@@ -3407,8 +3415,16 @@ function App() {
                     <div key={ri} style={{...card,marginBottom:20}}>
                       {/* Doc header */}
                       <div style={{padding:"14px 18px",background:"rgba(22,32,50,0.4)",borderBottom:"1px solid #162032",display:"flex",alignItems:"center",gap:10,flexWrap:"wrap"}}>
-                        {/* Transaction type badge */}
-                        {ex?.transactionType && (
+                        {/* Transaction type badge — clickable to toggle */}
+                        {ex?.transactionType && !ps && (
+                          <button onClick={()=>{
+                            const newType = ex.transactionType==="Bill" ? "Expense" : "Bill";
+                            setResults(prev => prev.map((r,i) => i===ri ? {...r, extracted:{...r.extracted, transactionType:newType}} : r));
+                          }} style={{padding:"3px 10px",background:ex.transactionType==="Bill"?"rgba(59,130,246,0.15)":"rgba(16,185,129,0.15)",border:`1px solid ${ex.transactionType==="Bill"?"rgba(59,130,246,0.3)":"rgba(16,185,129,0.3)"}`,borderRadius:4,fontSize:10,color:ex.transactionType==="Bill"?"#3b82f6":"#10b981",fontWeight:"bold",cursor:"pointer",title:"Click to toggle Bill/Expense"}}>
+                            {ex.transactionType==="Bill"?"📋 BILL ✎":"💵 EXPENSE ✎"}
+                          </button>
+                        )}
+                        {ex?.transactionType && ps && (
                           <span style={{padding:"3px 10px",background:ex.transactionType==="Bill"?"rgba(59,130,246,0.15)":"rgba(16,185,129,0.15)",border:`1px solid ${ex.transactionType==="Bill"?"rgba(59,130,246,0.3)":"rgba(16,185,129,0.3)"}`,borderRadius:4,fontSize:10,color:ex.transactionType==="Bill"?"#3b82f6":"#10b981",fontWeight:"bold"}}>
                             {ex.transactionType==="Bill"?"📋 BILL":"💵 EXPENSE"}
                           </span>
@@ -3438,7 +3454,7 @@ function App() {
                         {/* Post status */}
                         {ps?.status==="posting"&&<span style={{fontSize:11,color:"#f59e0b"}}>⏳ Posting...</span>}
                         {ps?.status==="already_posted"&&<span style={{fontSize:11,color:"#f59e0b"}}>⚠️ Already posted on {new Date(ps.processedAt).toLocaleDateString()} ({ps.txType} #{ps.qboId}) — dismissing...</span>}
-                        {ps?.status==="posted"&&!ps?.updated&&<span style={{fontSize:11,color:"#10b981"}}>✅ Posted to QBO ({ps.txType} #{ps.qboId}){ps.taxInvField ? ` · Tax Inv: ${ps.taxInvField}` : " · ⚠️ No tax inv field"}</span>}
+                        {ps?.status==="posted"&&!ps?.updated&&<span style={{fontSize:11,color:"#10b981"}}>✅ Posted to QBO ({ps.txType} #{ps.qboId}){ps.taxInvField ? ` · Tax Inv: ${ps.taxInvField}` : ""}</span>}
                         {ps?.status==="posted"&&ps?.updated&&!ps?.journalId&&<span style={{fontSize:11,color:"#06b6d4"}}>🔄 Updated #{ps.qboId} — Tax Invoice & PDF added</span>}
                         {ps?.status==="posted"&&ps?.updated&&ps?.journalId&&<span style={{fontSize:11,color:"#06b6d4"}}>🔄 Updated #{ps.qboId} — VAT moved to Confirmed (JE #{ps.journalId})</span>}
                         {ps?.status==="posted"&&ps?.updated&&ps?.journalError&&<span style={{fontSize:11,color:"#f59e0b"}}>🔄 Updated #{ps.qboId} — VAT journal failed: {ps.journalError}</span>}
