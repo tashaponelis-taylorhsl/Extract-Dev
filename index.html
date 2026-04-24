@@ -59,8 +59,18 @@ AMOUNT RULES:
   6. Non-VAT-registered vendor, uncertain → default vatCode="N"
 - Thai wholesale receipts with V/N codes and ExVat column (e.g. Makro, Lotus):
   Look for a column labeled "VAT CODE", "VAT", "V/N", or "ประเภทสินค้า" and read the code per row directly.
-  V items: read from มูลค่าสินค้า (ExVat) column → set vatCode="E" (already ex-VAT)
-  N items: read face value → set vatCode="N"
+  V items: read ยอดรวม (inclusive total per line) → set vatCode="V" (app divides by 1.07 to get ex-VAT)
+  N items: read face value → set vatCode="N" (never modified)
+  MAKRO/WHOLESALE VAT SUMMARY TABLE (rows at the bottom of the receipt) — columns in this exact order:
+  Col 1: รหัส ภพ. — VAT code group label (N or V)
+  Col 2: รวมจำนวนชิ้น — total quantity count (ignore)
+  Col 3: มูลค่าภาษี — ACTUAL VAT AMOUNT ← use this for vatAmount
+  Col 4: มูลค่าสินค้า ExVat — ex-VAT subtotal (for verification only)
+  Col 5: ยอดรวม — inclusive total (ex-VAT + VAT) — this is the grand total, NOT the VAT amount
+  From the รวม (total) row: vatAmount = Col 3 (มูลค่าภาษี), totalAmount = Col 5 (ยอดรวม)
+  Example row: "V=VAT | 3 | 11.32 | 161.68 | 173.00" → vatAmount=11.32, NOT 173.00
+  CRITICAL MISTAKE TO AVOID: ยอดรวม of the V=VAT row (e.g. 173.00) is the inclusive total of all V-coded lines.
+  It is NOT the VAT amount. The VAT amount is always the smaller number in Col 3 มูลค่าภาษี (e.g. 11.32).
 - Regular invoices (single VAT total at bottom):
   If lineSum ≈ totalAmount (lines include VAT): taxable lines → vatCode="V"
   If lineSum ≈ (totalAmount − vatAmount) (lines exclude VAT): taxable lines → vatCode="E"
@@ -367,7 +377,7 @@ LINE ITEM READING — LEFT TO RIGHT:
 - In Thai document tables: description is always the leftmost column; total/amount is always the rightmost column
 - Thai table column order is typically: description | unit | qty | unit price | ex-VAT amount | (VAT amount) | total
 - When columns are misaligned or ambiguous: always use the rightmost numeric value as the line amount
-- For Go Wholesale, Makro and similar Thai retailers: the ExVat column (มูลค่าสินค้า) is the correct line amount — NOT the total column or the VAT column
+- For Go Wholesale, Makro and similar Thai retailers: V-coded line items use ยอดรวม (inclusive total per line) with vatCode="V"; N-coded line items use face value with vatCode="N". Never use the มูลค่าภาษี (VAT) column as the line amount.
 - NEVER use quantity (จำนวน) or unit price (ราคาต่อหน่วย) as the line amount — these are not line totals
 - Do not skip or merge line items — include every line separately
 
